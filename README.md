@@ -8,7 +8,9 @@
   <img alt="tests" src="https://img.shields.io/badge/tests-319%20passing-2ea44f">
   <img alt="clippy" src="https://img.shields.io/badge/clippy-0%20warnings-2ea44f">
   <img alt="build" src="https://img.shields.io/badge/build-offline%20friendly-6f42c1">
-  <img alt="release" src="https://img.shields.io/badge/release-v0.1.0-1f6feb">
+  <a href="https://github.com/Yunlk/uai-core/actions/workflows/release.yml">
+    <img alt="release" src="https://github.com/Yunlk/uai-core/actions/workflows/release.yml/badge.svg">
+  </a>
 </p>
 
 > ## 免责声明
