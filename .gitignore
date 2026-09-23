@@ -1,0 +1,14 @@
+# 构建产物
+/target
+
+# 日志与临时文件
+*.log
+*.tmp
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+
+# 脱敏前的原文备份（绝不允许进仓库：含真实账户 ID）
+.scrub-backup/

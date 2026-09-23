@@ -1,0 +1,132 @@
+name: release
+
+# 触发方式三种：
+#   1) 推 main           → 跑 verify + build，产物在 Actions 的 Artifacts 里（不出 Release）
+#   2) 推 tag v*         → 再加一步 release，把三平台产物挂到 Releases 页（永久下载）
+#   3) Actions 页面手点  → 只构建，产物同样在 Artifacts 里
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# 发布 Release 需要写权限；默认的 GITHUB_TOKEN 权限是只读。
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ① 先跑测试：红了就不发版，避免把坏二进制发出去
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 注意：CI 上**不能**加 --offline（runner 没有 cargo 缓存，会找不到依赖）。
+      # 用 --locked 保证构建严格遵循仓库里的 Cargo.lock。
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # ② 构建各平台二进制
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: uai-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: uai-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: uai-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # 全项目只用 rustls（见 Cargo.toml），不依赖系统 OpenSSL，
+      # 所以三平台都不需要装额外系统库。
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 整理产物（Windows 是 .exe，其余去掉后缀）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/uai.exe" "${{ matrix.asset }}"
+          else
+            cp "target/${{ matrix.target }}/release/uai" "${{ matrix.asset }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # ③ 推 tag 时把产物挂到 Release 上（正式版，保留版本历史）
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  # ④ 推 main 时维护一个**滚动** Release（tag 名固定 `latest`）
+  #
+  # 好处：不用手动打 tag 也能有一个"公开、永久、免登录"的下载页，
+  # exe 永远是最新 main 的构建。与 ③ 并存：正式版走 tag，尝鲜走 latest。
+  #
+  # ⚠️ tag 必须**先删再建**，否则 tag 会钉在第一次的 commit 上（附件会更新、
+  #    但 tag 指向不动），`gh release delete --cleanup-tag` 就是干这个的。
+  latest:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 删掉旧的 latest release 与 tag（失败无妨：首次运行时本就不存在）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete latest --yes --cleanup-tag || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 最新构建（latest）
+          body: |
+            自动构建自 `main` 分支最新提交：${{ github.sha }}
+
+            这是**滚动预览版**，随每次推送 main 更新，不带版本号。
+            需要稳定版本请下载带版本号的 Release（如 `v0.1.0`）。
+          files: dist/*
+          draft: false
+          prerelease: true
+          generate_release_notes: false

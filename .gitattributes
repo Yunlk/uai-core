@@ -1,0 +1,35 @@
+# 统一行尾。仓库内**一律存 LF**，检出时不要自动转 CRLF。
+#
+# 为什么必须显式声明：Windows 上 Git for Windows 默认 core.autocrlf=true，
+# 会把工作区的 LF 转成 CRLF。CI（ubuntu/macos runner）检出后拿到的若是 CRLF，
+# `.github/workflows/*.yml` 里 `shell: bash` 的多行脚本会以
+#   $'\r': command not found
+# 失败；shell 脚本更会直接 bad interpreter。
+#
+# 配了这个文件后，所有平台检出都是 LF，不再依赖每台机器的 git 配置。
+
+* text=auto eol=lf
+
+# 明确按文本 + LF 处理
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.lock    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.sh      text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+LICENSE   text eol=lf
+
+# PowerShell 脚本给 Windows 用，保留 CRLF 更稳妥
+*.ps1     text eol=crlf
+
+# 二进制：不做任何行尾转换，也不做 diff
+*.exe     binary
+*.dll     binary
+*.png     binary
+*.jpg     binary
+*.wav     binary
+*.zip     binary
