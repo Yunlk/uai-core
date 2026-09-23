@@ -1,0 +1,39 @@
+[package]
+name = "uai-core"
+version = "0.1.0"
+edition = "2024"
+# edition 2024 需要 Rust 1.85+；但代码里用了 1.87 才稳定的 `is_multiple_of`，
+# 所以真实 MSRV 是 1.87 —— 写大了无所谓，写小了 clippy 的 incompatible_msrv 会当场抓住。
+rust-version = "1.87"
+description = "U校园接口核心库：一文件一端点的接口层 + 一文件一类型的题型层，可被单独调用与单独测试"
+# 非商业使用许可（允许任意改写与再分发，禁止商用）。用 license-file 指向
+# 自拟协议；不写 `license` 字段是为了避免 SPDX 校验对自定义条款报错。
+license-file = "LICENSE"
+
+# lib + bin 双 target。这是与旧工程最关键的差别：
+# 旧工程只有 bin，接口层无法被单独 import，只好在 examples/ 里把
+# 鉴权 + 解密 + 拼包复制一遍才能验一个接口 —— 复制出来的那份永远会和
+# 真正的调用点分叉。这里把接口层做成 lib，CLI 只是它的一个消费者。
+[lib]
+name = "uai_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uai"
+path = "src/bin/uai/main.rs"
+
+[dependencies]
+aes = "0.9.3"
+cbc = { version = "0.2.1", features = ["alloc"] }
+futures-util = "0.3.32"
+hex = "0.4.3"
+hmac = "0.12.1"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# 语音评测的签名是 SHA1(appId + secret + timestamp)，见 speech_eval 模块。
+sha1 = "0.10.7"
+sha2 = "0.10.9"
+# `macros` 提供 tokio::select!，时长加速器用它同时跑心跳与收包。
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "time", "macros", "signal"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
