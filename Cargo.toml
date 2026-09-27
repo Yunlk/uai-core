@@ -1,6 +1,6 @@
 [package]
 name = "uai-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # edition 2024 需要 Rust 1.85+；但代码里用了 1.87 才稳定的 `is_multiple_of`，
 # 所以真实 MSRV 是 1.87 —— 写大了无所谓，写小了 clippy 的 incompatible_msrv 会当场抓住。
