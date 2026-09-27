@@ -16,6 +16,7 @@
 //! ⚠️ 与 lib 内的加速器同源，属于**写入**行为：跑之前想清楚要不要在真实账号上跑。
 
 use futures_util::{SinkExt, StreamExt};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::connect_async;
@@ -119,7 +120,7 @@ async fn main() {
     let total: u64 = map.values().sum();
     println!("\n===== 真键房间结果 =====");
     let mut rows: Vec<_> = map.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|row| Reverse(row.1));
     for (module, secs) in &rows {
         println!("  {module}  +{secs}s");
     }
