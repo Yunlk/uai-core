@@ -217,8 +217,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     .map_err(|_| Error::invalid(format!("--sleep-ms 不是数字：{raw}")))?,
                 None => 0,
             };
-            // 默认 4：一组 4 次串行请求、每次约 150ms，串行是主要瓶颈。
-            // 再高会明显撞限流（实测约每 7 组一次），得不偿失。
+            // 默认 1（串行）：并发曾经默认 4，但实测反而更慢——一组要 4 次串行
+            // 请求，多路并发会互相拖住、还更容易撞限流。见 [`DEFAULT_JOBS`]。
             let jobs = match flag_value(rest, "--jobs") {
                 Some(raw) => {
                     let parsed = raw
@@ -523,7 +523,8 @@ U校园接口调试 CLI
   submit   <实例ID> <分组ID> [--confirm]
                                         组装提交载荷；**默认只预览不发送**
                                           --confirm  真正提交（会写服务端！）
-  auto     <实例ID> --class <班级> [--dry-run] [--limit N] [--redo] [--no-scan] [--sleep-ms N]
+  auto     <实例ID> --class <班级> [--dry-run] [--limit N] [--redo] [--no-scan]
+                    [--units u6,u7] [--jobs N] [--no-readback] [--sleep-ms N]
                                         **打通提交流水线**：按当前班级的必修筛选
                                         → 逐组组装 → 提交 → 回读
                                           默认**真的提交**；--dry-run 只预览
@@ -534,7 +535,15 @@ U校园接口调试 CLI
                                                          「已达标」是账号级痕迹，比门户
                                                          班级口径宽（实测 42/44 vs 6/44）
                                           --no-scan    不扫状态（等同 --redo，省每组一次请求）
-                                          --sleep-ms N 每组之间等待 N 毫秒
+                                          --units u6,u7 只交这些单元（缺省 = 全部必修单元）
+                                          --jobs N     并发处理 N 组（1~32，默认 1）
+                                                       实测并发会互相拖住、更易撞限流，
+                                                       默认串行；除非你清楚在干什么
+                                          --no-readback 不做回读（判分取提交响应里的
+                                                         state.score_pct，省一次 GET）
+                                          --sleep-ms N 每组之间等待 N 毫秒（默认 0）
+                                          ⚠️ 平台有节奏配额（实测连打 11 组后全回
+                                             600002），批量时请显式放大 --sleep-ms
                                         Ctrl-C 可中途停止，已提交的不会回滚
   media                                 媒体上传链状态与口语上报自检
   eval     <WAV> --text \"…\"             语音评测：送一段 WAV 去打分（**只评分，不提交**）

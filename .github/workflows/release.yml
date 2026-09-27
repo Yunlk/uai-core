@@ -16,6 +16,17 @@ on:
 permissions:
   contents: write
 
+# ★ 必须串行：`latest` job 和 `release` job 都在动 Releases 页。
+# 实测踩过：一次推 main（要更新 latest）和一次推 tag（要建正式版）几乎同时触发，
+# 两个 run 并发跑，`latest` job 在「删旧 release → 建新 release」中间被另一个
+# run 插队，结果 latest Release 被建出来但那一步挂了，**附件一个都没上传**——
+# 更糟的是 Releases 页看着「一切正常」。
+# 用固定 group 名把所有 run 排成队，不取消（发布中途被杀会留下半个 Release）。
+# 注意：这个 group 是**仓库级**的，不分 ref —— 这正是我们要的。
+concurrency:
+  group: release-page
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -100,8 +111,13 @@ jobs:
   # 好处：不用手动打 tag 也能有一个"公开、永久、免登录"的下载页，
   # exe 永远是最新 main 的构建。与 ③ 并存：正式版走 tag，尝鲜走 latest。
   #
-  # ⚠️ tag 必须**先删再建**，否则 tag 会钉在第一次的 commit 上（附件会更新、
-  #    但 tag 指向不动），`gh release delete --cleanup-tag` 就是干这个的。
+  # ⚠️ **顺序是「先推 tag，再建 release」**，别反过来。
+  #    `action-gh-release` 在 tag 已存在时会**直接复用、不移动**它，
+  #    所以只要能保证 tag 已经指向本次 commit，后面那步就不可能钉错。
+  #    踩过的两次：
+  #      1) tag 指向一个历史重建后的孤儿提交，之后永远不动；
+  #      2) 在删旧 release 与建新 release 之间被另一个 run 插队，附件全丢
+  #         （已用上面的 concurrency 串行化）。
   latest:
     needs: build
     if: github.ref == 'refs/heads/main'
@@ -109,24 +125,71 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: 删掉旧的 latest release 与 tag（失败无妨：首次运行时本就不存在）
+      - name: 把 latest tag 强制指到本次 commit（先做，保证后面不会钉错）
+        run: |
+          set -euo pipefail
+          # `-f` 覆盖本地；远端不存在也能新增。tag 指向一个还没有 Release 的
+          # commit 是完全合法的，所以这一步先做是安全的，也不留窗口。
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+      # 建/更新 latest release 并挂上三个附件。
+      #
+      # 这里**没有「删旧 Release」这一步**，是刻意的：
+      # `gh release delete` 会把 Release 和它的附件一起抹掉，中间那段窗口
+      # 一旦被打断（并发 run、超时、后续步骤失败），页面上就只剩一个空壳，
+      # 而 job 还可能报成功。现在的写法幂等且不留窗口——
+      # release 在就 edit + 换附件，不在才 create（tag 上面已经钉好）。
+      - name: 建/更新 latest release 并挂上三个附件
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete latest --yes --cleanup-tag || true
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: 最新构建（latest）
-          body: |
-            自动构建自 `main` 分支最新提交：${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有产物，不建空的 Release"
+            exit 1
+          fi
+          note="自动构建自 \`main\` 分支最新提交：$GITHUB_SHA
 
-            这是**滚动预览版**，随每次推送 main 更新，不带版本号。
-            需要稳定版本请下载带版本号的 Release（如 `v0.1.0`）。
-          files: dist/*
-          draft: false
-          prerelease: true
-          generate_release_notes: false
+          这是**滚动预览版**，随每次推送 main 更新，不带版本号。
+          需要稳定版本请下载带版本号的 Release（如 \`v0.1.0\`）。"
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --verify-tag \
+              --title '最新构建（latest）' --notes "$note" --prerelease
+          fi
+          gh release edit latest --title '最新构建（latest）' --notes "$note" --prerelease
+          # 先删同名旧附件，避免 --clobber 在某些版本上留下重复项。
+          for f in "${files[@]}"; do
+            name="$(basename "$f")"
+            gh release delete-asset latest "$name" --yes >/dev/null 2>&1 || true
+          done
+          gh release upload latest "${files[@]}" --clobber
+          echo "上传完成：$(printf '%s ' "${files[@]}")"
+      # ★ 自检：这个 job 以前会「成功」地把一个空壳 Release 留在页面上，
+      #   页面上完全看不出来。把「附件在不在」变成硬失败。
+      - name: 自检：tag 指向本次 commit，且三个附件都在
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse latest^{commit})"
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::latest tag 指向 $sha，不是本次 commit $GITHUB_SHA"
+            exit 1
+          fi
+          names="$(gh release view latest --json assets --jq '.assets[].name' | sort | tr '\n' ' ')"
+          echo "latest 附件：$names"
+          for want in uai-windows-x86_64.exe uai-linux-x86_64 uai-macos-arm64; do
+            case " $names " in
+              *" $want "*) ;;
+              *) echo "::error::latest Release 缺附件：$want"; exit 1 ;;
+            esac
+          done
+          echo "✅ latest tag=$sha，附件齐全"
+
