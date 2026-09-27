@@ -116,7 +116,13 @@ jobs:
       - name: 删掉旧的 latest release 与 tag（失败无妨：首次运行时本就不存在）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete latest --yes --cleanup-tag || true
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          # 兜底：`--cleanup-tag` 只删「挂在 release 上的 tag」。历史被重建过时，
+          # tag 可能指向一个已不在 main 上的孤儿提交，此时 tag 会留在原处不动，
+          # 后面的 action-gh-release 也**不会**把它挪过来（tag 已存在就复用）。
+          # 所以再显式删一次 tag，保证它落在本次的 commit 上。
+          git push origin :refs/tags/latest || true
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
