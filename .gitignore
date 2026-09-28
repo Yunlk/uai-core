@@ -12,3 +12,20 @@ Thumbs.db
 
 # 脱敏前的原文备份（绝不允许进仓库：含真实账户 ID）
 .scrub-backup/
+
+# ★ 会话凭据：真实运行时只写系统临时目录（%TEMP%），永不进仓库。
+#   这里再堵一道：万一手滑把它复制到工作区，别让 `git add .` 顺手带上。
+#   注意 uai-session.json 里含门户 JWT 与 open_id，等于账号钥匙。
+uai-session.json
+**/uai-session.json
+session.json
+**/session.json
+
+# 临时导出/探测产出（真实账号数据的常见外泄路径）
+tasks_before.json
+tasks_after.json
+tasks_kbrun.json
+grade_before.json
+required_tasks.json
+*_out.txt
+proof_chain.json

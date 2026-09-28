@@ -963,9 +963,6 @@ mod tests {
             node.pointer("/tutorial/resourceId").and_then(Value::as_str),
             Some("course-v2:unipus+ngce_vl_jc2_sz_ucloud+2024_01_31")
         );
-        assert_eq!(
-            node.get("strategyId").and_then(Value::as_i64),
-            Some(900001)
-        );
+        assert_eq!(node.get("strategyId").and_then(Value::as_i64), Some(900001));
     }
 }

@@ -1,0 +1,26 @@
+name: pii
+
+# 只做一件事：把「不得把真实账号数据写进仓库」这条硬规则变成能失败的一步。
+#
+# 起因（2026-09-28）：README 的 `uai whoami` 示例抄了真实输出里的姓；
+# 而 src/crypto.rs 的两个测试从 v0.1.0 起就把真实密码与真实手机号当夹具，
+# 一路随每个 tag 发出去。人眼会漏，所以交给机器。
+#
+# 检查项见 scripts/pii-scan.sh：会话缓存字段、真实手机号、
+# 硬编码凭据、环境变量里的真实值、whoami 输出形状。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pii:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 扫描真实账号数据 / 凭据
+        run: bash scripts/pii-scan.sh
