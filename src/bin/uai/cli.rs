@@ -22,6 +22,13 @@ pub enum Command {
         /// 只打印考核方案，不查成绩。
         plan_only: bool,
     },
+    /// 学习记录：教材 / 单元 / 子单元的**真实时长**（只读）。
+    Record {
+        /// 班级教材 ID（`courseResourceId`）。
+        course_resource_id: String,
+        /// 只列这个单元的子任务明细（如 `u5`）。不给就只列单元汇总。
+        unit: Option<String>,
+    },
     /// 班级真实进度。
     Progress {
         instance_id: String,
@@ -167,6 +174,14 @@ pub enum Command {
         page_base: Option<String>,
         /// 只投这些单元（如 `u6,u7`）；不给就投任务树里的全部必修。
         units: Vec<String>,
+        /// 并行连接数。默认 1；超出服务端并发上限的部分会被 503 拒绝。
+        conns: usize,
+        /// 把 `module` 换成分散名，验证「教材账只认 moduleGroup」这个假设。
+        spread: bool,
+        /// **实验**：stop 时把 timer 向前拨 N 秒，验证服务端是否信任客户端时间。
+        fake_secs: u64,
+        /// **实验**：所有连接都钉在这个分组上（验证是否会被去重）。
+        pin: Option<String>,
     },
     /// 列出全部题型。
     Types,
@@ -187,6 +202,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "grade" => Ok(Command::Grade {
             course_resource_id: one(rest, "grade")?,
             plan_only: rest.iter().any(|flag| flag == "--plan-only"),
+        }),
+        "record" => Ok(Command::Record {
+            course_resource_id: one(rest, "record")?,
+            unit: flag_value(rest, "--unit"),
         }),
         "types" => Ok(Command::Types),
         "submit" => {
@@ -359,7 +378,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 Some(raw) => raw
                     .parse::<f64>()
                     .map_err(|_| Error::invalid(format!("--dwell-min 不是数字：{raw}")))?,
-                None => 4.0,
+                None => 1.0,
             };
             if dwell_min <= 0.0 {
                 return Err(Error::invalid("--dwell-min 必须为正（单位：分钟）"));
@@ -373,6 +392,15 @@ pub fn parse(args: &[String]) -> Result<Command> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let conns = match flag_value(rest, "--conns") {
+                Some(raw) => raw
+                    .parse::<usize>()
+                    .map_err(|_| Error::invalid(format!("--conns 不是正整数：{raw}")))?,
+                None => 1,
+            };
+            if conns == 0 {
+                return Err(Error::invalid("--conns 至少为 1"));
+            }
             Ok(Command::Study {
                 instance_id,
                 class_id: required_class(rest)?,
@@ -380,6 +408,15 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 dwell_min,
                 page_base: flag_value(rest, "--page-base"),
                 units,
+                conns,
+                spread: rest.iter().any(|flag| flag == "--spread"),
+                pin: flag_value(rest, "--pin"),
+                fake_secs: match flag_value(rest, "--fake-secs") {
+                    Some(raw) => raw
+                        .parse::<u64>()
+                        .map_err(|_| Error::invalid(format!("--fake-secs 不是非负整数：{raw}")))?,
+                    None => 0,
+                },
             })
         }
         "targets" => Ok(Command::Targets {
@@ -556,11 +593,12 @@ U校园接口调试 CLI
            WAV 必须是 16kHz 单声道 16-bit
   duration [小时] [--rooms N]            学习时长加速（常驻，默认 1 小时 / 20 房间）
                                           ⚠️ 只进积分账，**不进必修学习时长**
-  study    <实例ID> --class <班级> [--hours N] [--dwell-min M] [--units u6,u7]
+  study    <实例ID> --class <班级> [--hours N] [--conns N] [--pin 分组]
                                          **真实必修任务时长投放**（进必修学习时长）
                                            单连接、轮换必修任务、约 1×（无倍率）
                                            --hours N      目标记账小时数，0/缺省 = 不限
-                                           --dwell-min M  每个任务停留几分钟后轮换（默认 4）
+                                           --dwell-min M  停留几分钟后结算轮换（默认 1）
+                                           --conns N      并行连接数（默认 1；多开实测更慢）
                                            --units u6,u7  只投这些单元（默认全部必修单元）
                                            --page-base   真实任务页前缀，不信用默认值时可覆盖
                                          Ctrl-C 停止；时间戳不可伪造，账只按真实时间走

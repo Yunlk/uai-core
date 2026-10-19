@@ -323,7 +323,7 @@ uai study course-v2:example0000+book_x+2024_01_31 --class 20000000002 \
 | --- | --- |
 | `--class <班级>` | **必填**，任务页前缀要用它 |
 | `--hours N` | 目标记账小时数；`0` 或缺省 = 不限，`Ctrl-C` 停 |
-| `--dwell-min M` | 每个任务停留几分钟后轮换（默认 4） |
+| `--dwell-min M` | 每个任务停留几分钟后结算轮换（默认 1，实测最优） |
 | `--units u6,u7` | 只投这些单元（默认全部必修单元） |
 | `--page-base` | 真实任务页前缀（含 `cid` / `cloudCurriculaId` / `courseResourceId`）。不信用默认值时可覆盖 |
 
