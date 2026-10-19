@@ -1,7 +1,7 @@
-//! 接口层：**一文件一端点**。
+//! 接口层：一文件一端点。
 //!
 //! 每个文件只负责自己那个接口：拼 URL（路径常量来自 [`crate::endpoints`]）、
-//! 发请求、把响应解析成强类型。**不掺业务判断**，也不缓存。
+//! 发请求、把响应解析成强类型。不掺业务判断，也不缓存。
 //!
 //! | 文件 | 端点 | 域名 |
 //! | --- | --- | --- |
@@ -15,12 +15,13 @@
 //! | [`answer`] | 标准答案（加密） | `ucontent.unipus.cn` |
 //! | [`progress`] | 单元级 / 目录级进度 | `ucontent.unipus.cn` |
 //! | [`group_state`] | 分组状态 + 作答快照 | `ucontent.unipus.cn` |
-//! | [`submit`] | 提交作答（**唯一写接口**） | `ucontent.unipus.cn` |
+//! | [`submit`] | 提交作答（唯一写接口） | `ucontent.unipus.cn` |
 //! | [`media`] | 录音上传 / 口语上报 | `ucontent.unipus.cn` |
 //! | [`duration`] | 学习时长（WebSocket） | `ucontent.unipus.cn` |
-//! | [`speech_eval`] | 语音评测（WebSocket，**只评分不提交**） | `speech.unipus.cn` |
-//! | [`assessment`] | 考核方案 / 综合成绩（**要宿主头**） | `uai.unipus.cn` |
-//! | [`targets`] | **必修筛选（组合层，非单一端点）** | — |
+//! | [`speech_eval`] | 语音评测（WebSocket，只评分不提交） | `speech.unipus.cn` |
+//! | [`assessment`] | 考核方案 / 综合成绩（要宿主头） | `uai.unipus.cn` |
+//! | [`study_record`] | 学习记录：教材/单元/子单元真实时长 | `uai.unipus.cn` |
+//! | [`targets`] | 必修筛选（组合层，非单一端点） | — |
 //!
 //! ## 读写分开
 //!
@@ -29,10 +30,10 @@
 //!
 //! ## 唯一的例外：[`targets`]
 //!
-//! 只有它不绑单一端点——因为「必修」这个信息**不在任何一个接口里**
+//! 只有它不绑单一端点——因为「必修」这个信息不在任何一个接口里
 //! （见 [`catalog`] 的模块文档），必须组合 [`progress`] 与 [`group_state`]。
 //! 它只读，但仍然单独成文件，理由是「一个文件一职责」：
-//! 职责是**筛选**，不是**调用**。
+//! 职责是筛选，不是调用。
 
 pub mod active_flag;
 pub mod answer;
@@ -48,6 +49,7 @@ pub mod login;
 pub mod media;
 pub mod progress;
 pub mod speech_eval;
+pub mod study_record;
 pub mod submit;
 pub mod targets;
 pub mod user_info;

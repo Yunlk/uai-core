@@ -24,9 +24,9 @@ const MAX_REQUEUE: u32 = 3;
 
 /// 重排队尾前让这一步退让多久。
 ///
-/// ⚠️ 曾经按「猛蹬」的测法设成 **0**（不等待、直接重排队尾再打），用来量服务端
-/// 在无退避下的反应。实测结论：连打 11 组后服务端开始回 `600002 操作过于频繁`，
-/// 且**退避为 0 时重排队尾只会立刻再撞一次**，等于把配额烧光。
+/// ⚠️ 曾经按「猛蹬」的测法设成 0（不等待、直接重排队尾再打），用来量服务端
+/// 在无退避下的反应。实测结论：连打 11 组后服务端开始回 600002 操作过于频繁，
+/// 且退避为 0 时重排队尾只会立刻再撞一次，等于把配额烧光。
 /// 现在恢复成真等待——留出配额恢复的窗口。
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(45);
 
@@ -132,6 +132,10 @@ pub fn run(command: Command) -> Result<()> {
             dwell_min,
             page_base,
             units,
+            conns,
+            spread,
+            fake_secs,
+            pin,
         } => study_cmd(
             &instance_id,
             &class_id,
@@ -139,7 +143,15 @@ pub fn run(command: Command) -> Result<()> {
             dwell_min,
             page_base.as_deref(),
             &units,
+            conns,
+            spread,
+            fake_secs,
+            pin.as_deref(),
         ),
+        Command::Record {
+            course_resource_id,
+            unit,
+        } => record_cmd(&course_resource_id, unit.as_deref()),
         Command::Types => types_cmd(),
     }
 }
@@ -155,7 +167,7 @@ fn credentials() -> Result<(String, String)> {
     Ok((user, pass))
 }
 
-/// 需要登录的命令：拿会话，必要时提示先 `login`。
+/// 需要登录的命令：拿会话，必要时提示先 login。
 fn require_session() -> Result<uai_core::Session> {
     let session = load_session().ok_or_else(|| {
         Error::invalid(format!(
@@ -169,19 +181,19 @@ fn require_session() -> Result<uai_core::Session> {
     Ok(session)
 }
 
-/// 把 `--class` 落到**门户里的具体班级**，并核对这本教材确实挂在那个班。
+/// 把 --class 落到门户里的具体班级，并核对这本教材确实挂在那个班。
 ///
 /// ## 为什么必须先定班
 ///
-/// 提交目标是**当前班级的必修**。同一本教材会挂在多个班，计分点分母不同
-/// （实测同一本《视听说2》：一个班 `49`、另一个班 `35`），所以「交哪些组」
+/// 提交目标是当前班级的必修。同一本教材会挂在多个班，计分点分母不同
+/// （实测同一本《视听说2》：一个班 49、另一个班 35），所以「交哪些组」
 /// 这件事离开班级就没有确定答案。
 ///
 /// ## 这里做的事
 ///
-/// 1. 读门户课程列表（按班给出 `finishPointNum/totalPointNum`）；
-/// 2. 用 `--class` 匹配 `classId` / 数字 `courseId` / 班级名；
-/// 3. 确认该班里确实有 `<实例ID>` 这本教材——**没有就直接失败**，
+/// 1. 读门户课程列表（按班给出 finishPointNum/totalPointNum）；
+/// 2. 用 --class 匹配 classId / 数字 courseId / 班级名；
+/// 3. 确认该班里确实有 <实例ID> 这本教材——没有就直接失败，
 ///    而不是拿着一个不存在的组合继续往下发写请求。
 fn resolve_class(
     session: &uai_core::Session,
@@ -245,7 +257,7 @@ fn resolve_class(
 /// 拿一个可用于 ucontent 的令牌。
 ///
 /// open_id 缺失时退回门户 JWT——目录/内容接口不校验鉴权，所以能用；
-/// 但**进度/答案接口会 401**，所以那种情况下要明确警告。
+/// 但进度/答案接口会 401，所以那种情况下要明确警告。
 fn ucontent_token(session: &uai_core::Session) -> Result<(String, bool)> {
     if session.can_touch_protected() {
         return Ok((session.annotator_token()?, true));
@@ -311,11 +323,90 @@ fn whoami() -> Result<()> {
 
 /// 考核方案 + 综合成绩。
 ///
-/// 链路：`courseResourceId` → `getCourseResourceInfoById`（拿数字 `courseId` 与
-/// `classId`）→ `/api/aca/{plan/detail, achievement/queryUserScore}`。
+/// 链路：courseResourceId → getCourseResourceInfoById（拿数字 courseId 与
+/// classId）→ /api/aca/{plan/detail, achievement/queryUserScore}。
 ///
-/// ⚠️ 考核接口的 `courseInstanceId` 是**数字 `courseId`**，不是 `course-v2:` 实例 ID；
-/// 直接传实例 ID 会让服务端抛 `Cannot deserialize value of type long from String`。
+/// ⚠️ 考核接口的 courseInstanceId 是数字 courseId，不是 course-v2: 实例 ID；
+/// 直接传实例 ID 会让服务端抛 Cannot deserialize value of type long from String。
+/// 把秒数格式化 HH:MM:SS。
+fn fmt_hms(total: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        total / 3600,
+        (total % 3600) / 60,
+        total % 60
+    )
+}
+
+/// 学习记录：教材 / 单元 / 子单元的真实时长（只读）。
+///
+/// 口径来自 /api/tla/learningDetail/studyRecord/*，与门户
+/// 「教材学习 → 学习记录」页完全同源。实测
+/// Σ unit.duration == totalDetail.duration，且叶子之和与单元一致。
+///
+/// ⚠️ 不要用 course_progress 的 leafs.duration：那个字段恒为 0。
+fn record_cmd(course_resource_id: &str, unit: Option<&str>) -> Result<()> {
+    let session = require_session()?;
+    if !session.can_touch_assessment() {
+        return Err(Error::invalid(
+            "学习记录需要门户会话（school + openId）。请重新 `uai login`。",
+        ));
+    }
+    let client = uai_core::transport::build_client()?;
+    let record = uai_core::api::study_record::fetch_total(
+        &client,
+        &session.portal_token,
+        course_resource_id,
+        &session.app_user_id,
+    )?;
+
+    println!(
+        "教材总时长：{}（{} 秒）",
+        fmt_hms(record.total_seconds),
+        record.total_seconds
+    );
+    println!(
+        "
+单元汇总："
+    );
+    for item in &record.units {
+        println!(
+            "  {:<4} {:<28} {} {}",
+            item.node_id,
+            item.name,
+            if item.required { "必修" } else { "　　" },
+            fmt_hms(item.seconds)
+        );
+    }
+
+    if let Some(unit_id) = unit {
+        let tasks = uai_core::api::study_record::fetch_unit_tasks(
+            &client,
+            &session.portal_token,
+            course_resource_id,
+            &session.app_user_id,
+            unit_id,
+        )?;
+        println!(
+            "
+单元 {unit_id} 子任务（{} 个）：",
+            tasks.len()
+        );
+        for task in &tasks {
+            println!(
+                "  {:<8} {:<26} {} {:<6} {} 进度 {}",
+                task.node_id,
+                task.name,
+                if task.required { "必修" } else { "　　" },
+                task.tab_type,
+                fmt_hms(task.seconds),
+                task.finish_progress
+            );
+        }
+    }
+    Ok(())
+}
+
 fn grade_cmd(course_resource_id: &str, plan_only: bool) -> Result<()> {
     let session = require_session()?;
     if !session.can_touch_assessment() {
@@ -443,9 +534,9 @@ fn grade_cmd(course_resource_id: &str, plan_only: bool) -> Result<()> {
     Ok(())
 }
 
-/// 毫秒时间戳字符串 → 可读时间（`YYYY-MM-DD`）。
+/// 毫秒时间戳字符串 → 可读时间（YYYY-MM-DD）。
 ///
-/// 只做简单换算，**不引 chrono**：这里的目的只是让人看懂周期，不是精确时间库。
+/// 只做简单换算，不引 chrono：这里的目的只是让人看懂周期，不是精确时间库。
 fn format_millis(text: &str) -> String {
     let Ok(millis) = text.trim().parse::<i64>() else {
         return if text.trim().is_empty() {
@@ -469,7 +560,7 @@ fn format_millis(text: &str) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// 秒数 → `HH:MM:SS`。
+/// 秒数 → HH:MM:SS。
 fn format_seconds(total: u32) -> String {
     format!(
         "{:02}:{:02}:{:02}",
@@ -516,8 +607,8 @@ fn progress_cmd(instance_id: &str) -> Result<()> {
     let client = uai_core::transport::build_client()?;
     let items = course_list::fetch(&client, &session.portal_token)?;
 
-    // ⚠️ 同一本教材会挂在多个班里，读数**各不相同**（实测《视听说2》三班 11/49、
-    // 二班 35/35）。所以这里把**所有**班级的读数都列出来，不挑一条就当答案。
+    // ⚠️ 同一本教材会挂在多个班里，读数各不相同（实测《视听说2》三班 11/49、
+    // 二班 35/35）。所以这里把所有班级的读数都列出来，不挑一条就当答案。
     let matches: Vec<&uai_core::api::course_list::CourseProgress> = items
         .iter()
         .filter(|item| item.instance_id == instance_id)
@@ -564,8 +655,8 @@ fn progress_cmd(instance_id: &str) -> Result<()> {
 
 /// 教材目录。
 ///
-/// `--required` 时用**单元级**必修过滤（第一级粗筛）。目录里没有必修标记，
-/// 所以这里只能做到单元级；任务级精筛见 `uai targets`。
+/// --required 时用单元级必修过滤（第一级粗筛）。目录里没有必修标记，
+/// 所以这里只能做到单元级；任务级精筛见 uai targets。
 fn catalog_cmd(instance_id: &str, required_only: bool) -> Result<()> {
     let session = require_session()?;
     let (token, _) = ucontent_token(&session)?;
@@ -647,7 +738,7 @@ fn catalog_cmd(instance_id: &str, required_only: bool) -> Result<()> {
     Ok(())
 }
 
-/// 解密题目内容：只显示题型与媒体下标，**不提交**。
+/// 解密题目内容：只显示题型与媒体下标，不提交。
 fn content_cmd(instance_id: &str, group_id: &str, raw: bool) -> Result<()> {
     let session = require_session()?;
     let (token, _) = ucontent_token(&session)?;
@@ -698,10 +789,10 @@ fn content_cmd(instance_id: &str, group_id: &str, raw: bool) -> Result<()> {
     Ok(())
 }
 
-/// 语音评测：把 WAV 送去打分。**只评分，不写任何服务端状态。**
+/// 语音评测：把 WAV 送去打分。只评分，不写任何服务端状态。
 ///
 /// 这是「口语题真实分数从哪来」的答案：分数由服务端评测产生，
-/// 而不是客户端编的。评测结果怎么用于提交是另一回事（见 `submit`）。
+/// 而不是客户端编的。评测结果怎么用于提交是另一回事（见 submit）。
 fn eval_cmd(
     wav: &std::path::Path,
     from_group: Option<&(String, String)>,
@@ -754,7 +845,7 @@ fn eval_cmd(
                 )));
             }
 
-            // ⚠️ 多子题必须**只取一道**：拼接会让完整度对不上。
+            // ⚠️ 多子题必须只取一道：拼接会让完整度对不上。
             // 实测 u5g341（5 个子题）拼接后 417 字 vs 音频一句 → 92 分掉到 29。
             if texts.len() > 1 {
                 println!("{group_id} 有 {} 个子题，每句要单独评测：", texts.len());
@@ -818,7 +909,7 @@ fn eval_cmd(
 
     let result = speech_eval::evaluate(request)?;
 
-    // ⑤ 只打印。**不提交。**
+    // ⑤ 只打印。不提交。
     println!("──── 评测结果 ────");
     println!("  总分      {} / 100", result.total);
     if result.accuracy > 0.0 {
@@ -852,19 +943,19 @@ fn eval_cmd(
 /// 从解密后的题目明文里提取「可朗读/可回答的英文文本」。
 ///
 /// 两类题都要用：
-/// - **朗读题**（`sentencerecord`）：取 `rule.text`，那是标准原文；
-/// - **开放题**（`presentation` / `oral-personal-state`）：`rule.text` 是题目本身。
+/// - 朗读题（sentencerecord）：取 rule.text，那是标准原文；
+/// - 开放题（presentation / oral-personal-state）：rule.text 是题目本身。
 ///
-/// ⚠️ **多子题的题必须按子题分别评测。** `u5g341` 有 5 个朗读子题，
-/// 每句一个 `rule.text`。若把 5 句拼成一段送去评，服务端的「完整度」会
-/// 按 5 句算，而音频只读了一句——实测总分从 92 掉到 **29**。
-/// 所以这里返回**逐子题的列表**，由调用方按 `--index` 选。
+/// ⚠️ 多子题的题必须按子题分别评测。 u5g341 有 5 个朗读子题，
+/// 每句一个 rule.text。若把 5 句拼成一段送去评，服务端的「完整度」会
+/// 按 5 句算，而音频只读了一句——实测总分从 92 掉到 29。
+/// 所以这里返回逐子题的列表，由调用方按 --index 选。
 fn extract_speech_texts(plain: &str) -> Vec<String> {
     let mut picked: Vec<String> = Vec::new();
 
-    // ① 优先取 `rule.text`——它才是判分依据。
+    // ① 优先取 rule.text——它才是判分依据。
     //
-    // ⚠️ **必须在原始串上扫描**：先反转义会把 `\"` 变成 `"`，
+    // ⚠️ 必须在原始串上扫描：先反转义会把 \" 变成 "，
     // 于是取值时把这个「真引号」当成结束符，文本被腰斩
     // （实测 "He said \"hi\" loudly." 只提取到 "He said"）。
     // 正确顺序是「按原样定位 → 再反转义取到的值」。
@@ -875,8 +966,8 @@ fn extract_speech_texts(plain: &str) -> Vec<String> {
         }
     }
 
-    // ② 没有 `rule.text` 就退回所有 `<p>` 段落。
-    // 标签本身是 `\u003c` 转义过的，所以这条要先反转义。
+    // ② 没有 rule.text 就退回所有 <p> 段落。
+    // 标签本身是 \u003c 转义过的，所以这条要先反转义。
     if picked.is_empty() {
         for capture in regex_find_p(&unescape(plain)) {
             let cleaned = strip_tags(&capture);
@@ -891,7 +982,7 @@ fn extract_speech_texts(plain: &str) -> Vec<String> {
     picked
 }
 
-/// 把明文里的 `\uXXXX` 与常见转义还原成可读文本。
+/// 把明文里的 \uXXXX 与常见转义还原成可读文本。
 fn unescape(text: &str) -> String {
     text.replace("\\u003c", "<")
         .replace("\\u003e", ">")
@@ -900,12 +991,12 @@ fn unescape(text: &str) -> String {
         .replace("\\n", " ")
 }
 
-/// 找出所有 `"rule":{…"text":"…"}` 里的 text 值，**按原样返回**（不反转义）。
+/// 找出所有 "rule":{…"text":"…"} 里的 text 值，按原样返回（不反转义）。
 ///
 /// 手写扫描而不引正则库——只需要这一处，且格式已知。
 ///
-/// ⚠️ 返回值保持转义形态，由调用方 [`unescape`]。若在这里就反转义，
-/// `\"` 会变成真引号，后续扫描无从分辨它是不是结束符。
+/// ⚠️ 返回值保持转义形态，由调用方 [unescape]。若在这里就反转义，
+/// \" 会变成真引号，后续扫描无从分辨它是不是结束符。
 fn regex_find_rule_text(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let marker = "\"text\":\"";
@@ -925,7 +1016,7 @@ fn regex_find_rule_text(text: &str) -> Vec<String> {
     out
 }
 
-/// 找出所有 `<p>…</p>` 里的内容。
+/// 找出所有 <p>…</p> 里的内容。
 fn regex_find_p(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -940,7 +1031,7 @@ fn regex_find_p(text: &str) -> Vec<String> {
     out
 }
 
-/// 找到下一个**未转义**的双引号下标。
+/// 找到下一个未转义的双引号下标。
 fn find_unescaped_quote(text: &str, from: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut index = from;
@@ -1076,7 +1167,7 @@ fn state_raw_cmd(instance_id: &str, group_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// 作答快照：自动取 `lastSubmit`。
+/// 作答快照：自动取 lastSubmit。
 fn snapshot_cmd(instance_id: &str, group_id: &str) -> Result<()> {
     let session = require_session()?;
     if !session.can_touch_protected() {
@@ -1123,16 +1214,16 @@ fn strip_noise(info: &Value) -> Value {
     json!(clone)
 }
 
-/// 组装提交载荷。**默认只预览**，`--confirm` 才真的发出去。
+/// 组装提交载荷。默认只预览，--confirm 才真的发出去。
 ///
 /// ## 为什么默认不发
 ///
-/// 提交是**唯一会写服务端**的操作，而且：
+/// 提交是唯一会写服务端的操作，而且：
 ///
 /// 1. 会消耗限流配额（实测约每 7 组被限一次）；
 /// 2. 服务端策略多为「一组只留首次记录」，发出去就改不了了。
 ///
-/// 所以默认把载荷打出来给你看，确认没问题再加 `--confirm`。
+/// 所以默认把载荷打出来给你看，确认没问题再加 --confirm。
 fn submit_cmd(instance_id: &str, group_id: &str, confirm: bool) -> Result<()> {
     let session = require_session()?;
     if !session.can_touch_protected() {
@@ -1156,8 +1247,8 @@ fn submit_cmd(instance_id: &str, group_id: &str, confirm: bool) -> Result<()> {
     let body = &prepared.body;
 
     // 本地自检：两个数组不等长会被服务端拒（code 300100），提前拦下。
-    // `prepare` 内部已经验过一次，这里再验一次是因为载荷最终要发出去，
-    // 而 `validate` 很便宜——不省钱的地方省心。
+    // prepare 内部已经验过一次，这里再验一次是因为载荷最终要发出去，
+    // 而 validate 很便宜——不省钱的地方省心。
     uai_core::api::submit::validate(body)?;
 
     let completed = body["isCompleted"].as_array().map(Vec::len).unwrap_or(0);
@@ -1217,9 +1308,9 @@ fn submit_cmd(instance_id: &str, group_id: &str, confirm: bool) -> Result<()> {
 
 /// 安装 Ctrl-C 停止开关。
 ///
-/// 阻塞式 reqwest 没法中途 abort，所以「停止」只能是**组间检查**：
+/// 阻塞式 reqwest 没法中途 abort，所以「停止」只能是组间检查：
 /// 收到 Ctrl-C 后把旗标置真，当前这一组跑完就不再开下一组。
-/// 已经在飞的那一组**无法撤回**——提交是写操作，没有回滚。
+/// 已经在飞的那一组无法撤回——提交是写操作，没有回滚。
 fn install_stop_flag() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     let handle = Arc::clone(&flag);
@@ -1244,14 +1335,14 @@ fn next_job(queue: &Mutex<VecDeque<(usize, u32)>>) -> Option<(usize, u32)> {
 
 /// 这个错误是不是「打太快了」而不是「这一组有问题」。
 ///
-/// ## 实测（2026-09，`--jobs 32`）
+/// ## 实测（2026-09，--jobs 32）
 ///
-/// 并发一上来，服务器**在边缘就挡**：返回 `HTTP 503` + HTML，连读内容都挡
-/// （44 组 0 接受、64 次业务限流）。这跟 `600002` 是一回事——速率问题，
+/// 并发一上来，服务器在边缘就挡：返回 HTTP 503 + HTML，连读内容都挡
+/// （44 组 0 接受、64 次业务限流）。这跟 600002 是一回事——速率问题，
 /// 不是这一组坏了，所以值得重排而不是记成失败。
 ///
 /// ⚠️ 旧文案把 503+HTML 说成「多半是鉴权失败被重定向到登录页」，
-/// 在这个场景下是**误导**：会话是好的，是请求太密。
+/// 在这个场景下是误导：会话是好的，是请求太密。
 fn is_transient(error: &Error) -> bool {
     let message = error.message();
     message.contains("503")
@@ -1260,31 +1351,31 @@ fn is_transient(error: &Error) -> bool {
         || message.contains("连接")
 }
 
-/// **打通提交流水线**：必修筛选 → 逐组组装 → 提交 → 回读。
+/// 打通提交流水线：必修筛选 → 逐组组装 → 提交 → 回读。
 ///
-/// ## 为什么它不是 `submit` 的 `--confirm`
+/// ## 为什么它不是 submit 的 --confirm
 ///
-/// `submit` 是**单组**的、默认预览的调试命令。真要用起来需要的是
-/// 「把**当前班级在这本教材上的必修分组**全部交掉」——那件事需要按班级
+/// submit 是单组的、默认预览的调试命令。真要用起来需要的是
+/// 「把当前班级在这本教材上的必修分组全部交掉」——那件事需要按班级
 /// 圈定必修、逐个组装、逐个回读、限流退避、中途可停。这就是本命令。
 ///
 /// ## 交什么：当前班级的必修，不是「有可判分题的组」
 ///
-/// 口径是 `progress` 接口里的 `rt.leafs.<gid>.strategies.required`
-/// ——它一次请求就给到分组级，**且正是门户「教程学习成绩」的分母**
-/// （实测本班 49）。旧实现用单元级粗筛（148）＋逐组 `flowStrategy`
-/// （45）：既多扫几百次请求，又漏掉 4 个 `purecontent`（门户确实计分）。
+/// 口径是 progress 接口里的 rt.leafs.<gid>.strategies.required
+/// ——它一次请求就给到分组级，且正是门户「教程学习成绩」的分母
+/// （实测本班 49）。旧实现用单元级粗筛（148）＋逐组 flowStrategy
+/// （45）：既多扫几百次请求，又漏掉 4 个 purecontent（门户确实计分）。
 ///
-/// 班级必须由 `--class` 显式给出：同一本教材挂在多个班时分母不同
+/// 班级必须由 --class 显式给出：同一本教材挂在多个班时分母不同
 /// （49 vs 35），猜错就是按错的口径交。
 ///
 /// ## 默认真的发
 ///
-/// 与 `submit` 相反：`auto` **默认提交**，`--dry-run` 才是预览。
-/// 理由是这个命令存在的全部意义就是提交；再要一次 `--confirm`
-/// 只是让人多敲一次。但 `--dry-run` 会把**与真发逐字节一致**的载荷
-/// 打出来（同一个 `prepare`），方便先核对。
-/// `auto` 的运行参数。
+/// 与 submit 相反：auto 默认提交，--dry-run 才是预览。
+/// 理由是这个命令存在的全部意义就是提交；再要一次 --confirm
+/// 只是让人多敲一次。但 --dry-run 会把与真发逐字节一致的载荷
+/// 打出来（同一个 prepare），方便先核对。
+/// auto 的运行参数。
 ///
 /// 铺成 9 个参数时调用点没人看得懂哪个 true 是哪个（clippy 也会拦）。
 struct AutoRun {
@@ -1313,7 +1404,7 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
 
     // 回读是 4 次往返里的最后 1 次（一组：内容 → 答案 → 提交 → 回读）。
     // 每次往返实测 70~100ms，砍掉它省 1/4 的时间；判分改取提交响应里的
-    // `state.score_pct`（同样是服务端写的，且比回读更新鲜）。
+    // state.score_pct（同样是服务端写的，且比回读更新鲜）。
     let do_readback = !no_readback;
     let session = require_session()?;
     if !session.can_touch_protected() {
@@ -1324,7 +1415,7 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
     let token = session.annotator_token()?;
     let client = uai_core::transport::build_client()?;
 
-    // ⓪ 先定班：交的是**当前班级**的必修。
+    // ⓪ 先定班：交的是当前班级的必修。
     let class = resolve_class(&session, instance_id, class_selector)?;
     println!("实例：{instance_id}");
     println!(
@@ -1353,8 +1444,8 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
         move || flag.load(Ordering::SeqCst)
     };
 
-    // ★ 必修口径**按班**：门户 `courseStudyStrategy/detail`（一次请求，
-    //   带逐单元必需集与 `passScore`）。同一实例在不同班里的必修集可以完全不相交。
+    // ★ 必修口径按班：门户 courseStudyStrategy/detail（一次请求，
+    //   带逐单元必需集与 passScore）。同一实例在不同班里的必修集可以完全不相交。
     let scope = build_class_scope(&client, &session, instance_id, &class);
     println!("正在按当前班级筛必修（门户按班策略）…");
     let plan = targets::plan(
@@ -1367,14 +1458,14 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
             scope: Some(&scope),
         },
         PlanOptions {
-            // `--no-scan` 与 `--redo` 等价：不扫状态 ⇒ 已达标的也不排除。
+            // --no-scan 与 --redo 等价：不扫状态 ⇒ 已达标的也不排除。
             skip_passed: !redo && !no_scan,
         },
         &should_stop,
     )?;
     let mut plan = plan;
-    // `--units u6,u7,u8`：只交这些单元。服务端有提交节奏配额（实测连打 11 组
-    // 就被 `600002` 摁住），分批交比整本硬打更实际。
+    // --units u6,u7,u8：只交这些单元。服务端有提交节奏配额（实测连打 11 组
+    // 就被 600002 摁住），分批交比整本硬打更实际。
     if !units.is_empty() {
         let keep = |id: &String| units.iter().any(|unit| id.starts_with(&format!("{unit}g")));
         let before = plan.groups.len();
@@ -1401,7 +1492,7 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
         );
     }
 
-    // 班级分母与必修组数的对照：口径不一致时**当场可见**，而不是等门户对不上账。
+    // 班级分母与必修组数的对照：口径不一致时当场可见，而不是等门户对不上账。
     if plan.required_total > 0 && class.total > 0 && plan.required_total != class.total as usize {
         println!(
             "⚠️ 口径不一致：leafs.required {} 组，门户本班分母 {}。\n\
@@ -1431,12 +1522,12 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
         );
     }
 
-    // ③ 逐组提交：`jobs` 个 worker 抢一个共享队列。
+    // ③ 逐组提交：jobs 个 worker 抢一个共享队列。
     //
     //    组与组之间没有依赖（每组只是「2 次读 + 1 次写 + 1 次回读」），
     //    所以并行能直接缩短墙钟。
     //
-    //    ⚠️ **撞限流不能原地睡**：`submit_one` 的退避是 20/40/60/80 秒，
+    //    ⚠️ 撞限流不能原地睡：submit_one 的退避是 20/40/60/80 秒，
     //    16 路并发时全部 worker 会被睡死——实测 50 秒只推了 6 组，比串行还慢。
     //    这里改成「重排到队尾 + 全局冷卻」，让别的组继续跑。
     println!(
@@ -1459,9 +1550,9 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                // ⚠️ 重试次数必须**跟着这一组走**。曾经它在每次出队后被清零，
+                // ⚠️ 重试次数必须跟着这一组走。曾经它在每次出队后被清零，
                 //    于是「重排 → 出队 → 清零 → 再重排」成了热循环：实测
-                //    `--jobs 2` 4 组跑了 131 秒、559 次重排，全是空转。
+                //    --jobs 2 4 组跑了 131 秒、559 次重排，全是空转。
                 while let Some((index, tries)) = next_job(&queue) {
                     if should_stop() {
                         queue
@@ -1509,7 +1600,7 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
                                 .push((index, outcome));
                         }
                         Err(error) => {
-                            // 503/超时这类**边缘限流**也算一次重试机会：它多半是
+                            // 503/超时这类边缘限流也算一次重试机会：它多半是
                             // 「打太快了」，而不是这一组本身有问题。
                             if is_transient(&error) && tries < MAX_REQUEUE {
                                 {
@@ -1620,10 +1711,10 @@ fn auto_cmd(instance_id: &str, class_selector: &str, run: AutoRun) -> Result<()>
     Ok(())
 }
 
-/// `auto --dry-run`：只组装并本地自检，**一个写请求都不发**。
+/// auto --dry-run：只组装并本地自检，一个写请求都不发。
 ///
-/// 走的是与真提交同一个 [`submit::prepare`]，所以这里看到的载荷
-/// 就是去掉 `--dry-run` 后会原样发出去的那份。
+/// 走的是与真提交同一个 [submit::prepare]，所以这里看到的载荷
+/// 就是去掉 --dry-run 后会原样发出去的那份。
 fn auto_dry_run(
     instance_id: &str,
     session: &uai_core::Session,
@@ -1689,8 +1780,8 @@ fn auto_dry_run(
 
 /// 媒体：报告上传链状态，并对「参数校验」做一次离线自检。
 ///
-/// **不发任何请求**——上传链未接入，没有可发的合法载荷。
-/// 这个命令存在的意义是把「未接入」这件事变成**可执行、可核对**的，
+/// 不发任何请求——上传链未接入，没有可发的合法载荷。
+/// 这个命令存在的意义是把「未接入」这件事变成可执行、可核对的，
 /// 而不是只写在文档里。
 fn media_cmd() -> Result<()> {
     println!(
@@ -1752,7 +1843,7 @@ fn media_cmd() -> Result<()> {
     Ok(())
 }
 
-/// 账号级必修集（`leafs` 端点）——**降级路径**，不按班。
+/// 账号级必修集（leafs 端点）——降级路径，不按班。
 fn fetch_account_level_required(
     client: &reqwest::blocking::Client,
     token: &str,
@@ -1776,17 +1867,17 @@ fn fetch_account_level_required(
         .collect())
 }
 
-/// 组装**按班**取必修的上下文。
+/// 组装按班取必修的上下文。
 ///
 /// 五项键来自两处，缺一不可：
 ///
 /// | 字段 | 来源 |
 /// | --- | --- |
-/// | `courseResourceId` / `resourceId` / `strategyId` | 门户课程列表的**教材节点** |
-/// | `courseInstanceId` | 同上（`instanceId`） |
-/// | `courseId`（如 `34852`） | `/api/aca/plan/detail` 的 `value.courseId` |
+/// | courseResourceId / resourceId / strategyId | 门户课程列表的教材节点 |
+/// | courseInstanceId | 同上（instanceId） |
+/// | courseId（如 34852） | /api/aca/plan/detail 的 value.courseId |
 ///
-/// 拿不到 `courseId` 时 `is_usable()` 为假，调用方会自动退回账号级口径。
+/// 拿不到 courseId 时 is_usable() 为假，调用方会自动退回账号级口径。
 fn build_class_scope(
     client: &reqwest::blocking::Client,
     session: &uai_core::Session,
@@ -1794,7 +1885,7 @@ fn build_class_scope(
     class: &course_list::CourseProgress,
 ) -> uai_core::api::class_required::ClassScope {
     let host = session.host_identity();
-    // `courseId` 只能从考核方案里取；失败不致命（退化成账号级口径）。
+    // courseId 只能从考核方案里取；失败不致命（退化成账号级口径）。
     let course_id = assessment::fetch_plan(
         client,
         &session.portal_token,
@@ -1815,38 +1906,39 @@ fn build_class_scope(
     }
 }
 
-/// **真实必修任务时长投放**（`uai study`）。
+/// 真实必修任务时长投放（uai study）。
 ///
-/// ## 它和 `duration` 是两条不同的账
+/// ## 它和 duration 是两条不同的账
 ///
-/// | | `duration`（房间池） | `study`（本命令） |
+/// | | duration（房间池） | study（本命令） |
 /// | --- | --- | --- |
-/// | 端点 / 事件 | `/unipusiopoint/` + `kick-v2` | `/unipusio/` + `start` |
-/// | 归属键 | 假名 `(应用, 设备)` | **`(真实分组, 真实课程)`** |
-/// | 倍率 | 13.7~14.9× | **1×（账号级封顶）** |
+/// | 端点 / 事件 | /unipusiopoint/ + kick-v2 | /unipusio/ + start |
+/// | 归属键 | 假名 (应用, 设备) | (真实分组, 真实课程) |
+/// | 倍率 | 13.7~14.9× | 1×（账号级封顶） |
 /// | 进 item 30 | ❌ 实测 1.144h 后 9 分钟无变化 | ✅ 当场落账 |
 ///
 /// ## URL 怎么造（实测规则，够全自动）
 ///
-/// ```text
 /// {前缀}#/{实例ID}/courseware/{单元}/{micro}/{分组}
-/// ```
 ///
 /// | 段 | 要求 | 依据 |
 /// | --- | --- | --- |
-/// | `<实例ID>` | 真实 | — |
-/// | `<分组>` | **真实且属于该课程** | 假 unit 实测 0 记账 |
-/// | `<单元>` | 必须与分组匹配 | 同上 |
-/// | `<micro>` | **随便填**（假名 / 单元名 / 空都行） | 三跑实测均落进目标分组 |
-/// | 查询串 | 不能整个省，但 `courseResourceId` 可省 | 空查询串实测 0 记账 |
+/// | <实例ID> | 真实 | — |
+/// | <分组> | 真实且属于该课程 | 假 unit 实测 0 记账 |
+/// | <单元> | 必须与分组匹配 | 同上 |
+/// | <micro> | 随便填（假名 / 单元名 / 空都行） | 三跑实测均落进目标分组 |
+/// | 查询串 | 不能整个省，但 courseResourceId 可省 | 空查询串实测 0 记账 |
 ///
-/// 所以分组清单与单元来自 ucontent 目录、必修性来自 `leafs`，
-/// **不需要门户任务树**。
+/// 所以分组清单与单元来自 ucontent 目录、必修性来自 leafs，
+/// 不需要门户任务树。
 ///
 /// ## 倍率没有捷径
 ///
 /// 同课 4 连接 0.63×、跨 3 门课并行 0.69× —— 预算按账号 ~1× 封顶。
-/// 所以这里**只开一条连接**，靠轮换必修任务覆盖整本书。
+/// 所以这里只开一条连接，靠轮换必修任务覆盖整本书。
+// 这些是 CLI 的扁平选项（实例、班级、时长、轮换、连接数、实验开关……），
+// 打包成结构体只是把同样的字段换个地方堆，不增加任何约束。
+#[allow(clippy::too_many_arguments)]
 fn study_cmd(
     instance_id: &str,
     class_selector: &str,
@@ -1854,6 +1946,10 @@ fn study_cmd(
     dwell_min: f64,
     page_base: Option<&str>,
     units: &[String],
+    conns: usize,
+    spread: bool,
+    fake_secs: u64,
+    pin: Option<&str>,
 ) -> Result<()> {
     let session = require_session()?;
     if !session.can_touch_assessment() {
@@ -1868,7 +1964,7 @@ fn study_cmd(
     let page_base = match page_base {
         Some(text) if !text.trim().is_empty() => text.to_owned(),
         _ => {
-            // 「班级教材ID」不用抄地址栏：门户课程列表里**教材节点自己的 `id`**
+            // 「班级教材ID」不用抄地址栏：门户课程列表里教材节点自己的 id
             // 就是它（实测《基础篇综合教程2》= 20000000002）。
             let resource_id = course_list::fetch(&client, &session.portal_token)
                 .map(|items| {
@@ -1897,23 +1993,43 @@ fn study_cmd(
         }
     };
 
-    // ② 必修分组 → 真实 `(单元, micro, 分组)`。
+    // ② 必修分组 → 真实 (单元, micro, 分组)。
     //
-    // ★ **不需要门户任务树**（实测 `micro` 随便填照样记账）：
-    //   分组与归属单元来自 ucontent 目录（`catalog`），
-    //   「哪些必修」来自 `leafs`（tasks 端点，一次请求），
-    //   `micro` 直接填单元名——实测 `u6/u6/u6g235` 一样落进 `u6g235`。
+    // ★★ 必修口径：按班级教材（与 targets 命令同源），不是账号级 leafs。
+    //
+    // 两者可能完全不相交：同一本教材在账号级是 u1/u3/u4、在班级策略上是 u5–u8。
+    // 用错口径的典型症状是——连接建上了、start/stop 全回 code:0、
+    // 结算日志照滚，时长却一分不涨（服务端只给班级口径里的必修项记账）。
     let token = session.annotator_token()?;
     let catalog = catalog::fetch(&client, &token, instance_id)?;
-    let mut all_ids: Vec<String> = catalog
-        .units
-        .iter()
-        .flat_map(|unit| unit.groups.iter())
-        .map(|group| group.id.clone())
-        .collect();
-    all_ids.sort();
-    all_ids.dedup();
-    let leafs = progress::fetch_leafs(&client, &token, instance_id, &session.open_id, &all_ids)?;
+
+    let scope = build_class_scope(&client, &session, instance_id, &class);
+    let (required_ids, source) = if scope.is_usable() {
+        match uai_core::api::class_required::fetch_strategy(&client, &scope) {
+            Ok(strategy) => (
+                strategy.required_tasks(),
+                format!("按班策略（{}）", strategy.class_name),
+            ),
+            Err(error) => {
+                println!(
+                    "⚠️ 按班策略取数失败（{}），降级到账号级 leafs（**不按班**）",
+                    error.message()
+                );
+                (
+                    fetch_account_level_required(&client, &token, instance_id, &session, &catalog)?,
+                    "账号级 leafs（**不按班**）".to_owned(),
+                )
+            }
+        }
+    } else {
+        println!("⚠️ 拿不到按班五件套，降级到账号级 leafs（**不按班**）");
+        (
+            fetch_account_level_required(&client, &token, instance_id, &session, &catalog)?,
+            "账号级 leafs（**不按班**）".to_owned(),
+        )
+    };
+    let required: std::collections::HashSet<String> = required_ids.into_iter().collect();
+    println!("必修口径：{source} → {} 组", required.len());
 
     let mut targets: Vec<uai_core::api::duration::TaskTarget> = Vec::new();
     for unit in &catalog.units {
@@ -1921,15 +2037,11 @@ fn study_cmd(
             continue;
         }
         for group in &unit.groups {
-            let required = leafs
-                .get(&group.id)
-                .map(|leaf| leaf.required)
-                .unwrap_or(false);
-            if required {
+            if required.contains(&group.id) {
                 targets.push(uai_core::api::duration::TaskTarget {
                     instance: instance_id.to_owned(),
                     unit: unit.id.clone(),
-                    // `micro` 只是 URL 里的过场段：实测填单元名即可。
+                    // micro 只是 URL 里的过场段：实测填单元名即可。
                     micro: unit.id.clone(),
                     group: group.id.clone(),
                 });
@@ -1977,6 +2089,10 @@ fn study_cmd(
         page_base,
         target_secs: (hours * 3600.0) as u64,
         dwell: Duration::from_secs_f64(dwell_min * 60.0),
+        conns,
+        spread,
+        fake_secs,
+        pin: pin.map(str::to_owned),
         ..Default::default()
     };
     let _stopped = uai_core::api::duration::start_task_boost(
@@ -2023,8 +2139,8 @@ fn study_cmd(
     Ok(())
 }
 ///
-/// ⚠️ 这是**唯一会长时间占用终端**的命令（默认 1 小时）。
-/// 每 5 秒打一次状态；`Ctrl-C` 会优雅停下（关闭所有连接后退出）。
+/// ⚠️ 这是唯一会长时间占用终端的命令（默认 1 小时）。
+/// 每 5 秒打一次状态；Ctrl-C 会优雅停下（关闭所有连接后退出）。
 fn duration_cmd(hours: f64, rooms: usize) -> Result<()> {
     let session = require_session()?;
     if !session.can_touch_protected() {
@@ -2045,8 +2161,8 @@ fn duration_cmd(hours: f64, rooms: usize) -> Result<()> {
     println!("按 Ctrl-C 停止。\n");
 
     let (tx, rx) = std::sync::mpsc::channel();
-    // Ctrl-C 由 `start_boost` 内部接管（tokio::signal），所以 CLI 不需要
-    // 这个停止开关。仍然接收它：库的调用方可以据此**程序化**停止，
+    // Ctrl-C 由 start_boost 内部接管（tokio::signal），所以 CLI 不需要
+    // 这个停止开关。仍然接收它：库的调用方可以据此程序化停止，
     // CLI 只是不用而已。
     let _stopped = uai_core::api::duration::start_boost(
         session.open_id.clone(),
@@ -2093,10 +2209,10 @@ fn duration_cmd(hours: f64, rooms: usize) -> Result<()> {
     Ok(())
 }
 
-/// 必修筛选：口径是 `leafs.required`（= 门户「教程学习成绩」的分母）。
+/// 必修筛选：口径是 leafs.required（= 门户「教程学习成绩」的分母）。
 ///
-/// ⚠️ 旧版本这里是「单元级粗筛 + 逐组 `flowStrategy.required` 精筛」，
-/// 两个毛病：多扫几百次请求；漏掉 4 个 `purecontent`（门户确实计分）。
+/// ⚠️ 旧版本这里是「单元级粗筛 + 逐组 flowStrategy.required 精筛」，
+/// 两个毛病：多扫几百次请求；漏掉 4 个 purecontent（门户确实计分）。
 /// 现在必修一次请求就拿全，逐组扫只用来说明「哪些已达标」。
 fn targets_cmd(
     instance_id: &str,
@@ -2139,8 +2255,8 @@ fn targets_cmd(
         }
     );
 
-    // 必修集：**按班**（门户 `chapters/unitTaskSituation`，键是 (班,书) 绑定的
-    // `courseResourceId`）。拿不到才退回账号级的 `leafs`——那个不随班级变，
+    // 必修集：按班（门户 chapters/unitTaskSituation，键是 (班,书) 绑定的
+    // courseResourceId）。拿不到才退回账号级的 leafs——那个不随班级变，
     // 同一实例在不同班里可能给出完全不相交的集合。
     let scope = build_class_scope(&client, &session, instance_id, &class);
     let (mut required, source) = if scope.is_usable() {
@@ -2264,10 +2380,10 @@ fn types_cmd() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// ★ 多子题必须**逐个**返回，不能拼成一段。
+    /// ★ 多子题必须逐个返回，不能拼成一段。
     ///
-    /// 实测 `u5g341` 有 5 个朗读子题：拼接后是 417 字，而音频只读一句，
-    /// 完整度按 5 句算 → 总分从 92 掉到 **29**。这个测试钉住「逐子题」。
+    /// 实测 u5g341 有 5 个朗读子题：拼接后是 417 字，而音频只读一句，
+    /// 完整度按 5 句算 → 总分从 92 掉到 29。这个测试钉住「逐子题」。
     #[test]
     fn extracts_each_subquestion_separately() {
         let plain = r#"[{"content":"{\"replyType\":\"record\",\"children\":[\
@@ -2280,7 +2396,7 @@ mod tests {
         assert_eq!(texts[1], "Second sentence here.");
     }
 
-    /// 明文里的 `\u003c` 等转义要先还原再剥标签。
+    /// 明文里的 \u003c 等转义要先还原再剥标签。
     #[test]
     fn unescapes_and_strips_tags() {
         let plain = r#"{"rule":{"text":"\u003cp\u003eHello \u0026nbsp;world\u003c/p\u003e"}}"#;
@@ -2289,7 +2405,7 @@ mod tests {
         assert_eq!(texts[0], "Hello world", "转义与 &nbsp; 都要处理掉");
     }
 
-    /// 没有 `rule.text` 时退回 `<p>` 段落，且过滤掉太短的中文/噪声。
+    /// 没有 rule.text 时退回 <p> 段落，且过滤掉太短的中文/噪声。
     #[test]
     fn falls_back_to_paragraphs() {
         let plain = r#"{"contents":[{"text":"<p>This is a long enough English sentence.</p>"},
@@ -2323,7 +2439,7 @@ mod tests {
         assert_eq!(texts, vec!["Stop here.".to_owned()]);
     }
 
-    /// 转义引号（`\"`）不算结束——朗读题文本里可能出现引号。
+    /// 转义引号（\"）不算结束——朗读题文本里可能出现引号。
     #[test]
     fn escaped_quote_does_not_terminate() {
         let plain = r#"{"rule":{"text":"He said \"hi\" loudly."}}"#;
